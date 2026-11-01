@@ -31,7 +31,7 @@ RULES
 1. Opening hook (0-2s): a surprising fact, a counterintuitive claim, or a visual tease that makes the viewer need the answer. No intros, no "in this video".
 2. Re-hooks: open a new loop or deliver a reveal every 5-8 seconds (at least 3).
 3. Story order: what it is -> how it moves -> why it matters -> payoff. One idea per beat.
-4. Ending: land the most satisfying reveal last, and make the final line flow back into the first so the Short loops.
+4. Ending: land the most satisfying reveal, then a short call to action that teases the next video in the series (name the next topic) and asks viewers to stay subscribed.
 5. Word budget: about 2.5 words per second (110-130 words for 45s). Short, punchy sentences.
 6. Visuals: every beat names a visual buildable as an isometric animated figure with the anatomy skill: cutaway, exploded view, part highlight, moving parts, live readout or counter, labels, and effects like fire, exhaust or sparks. Change the visual every 1.5-3 seconds. Vertical 9:16: keep the subject centred, leave the top 15% and bottom 25% clear for captions and YouTube's buttons.
 7. Accuracy: state only what the reference or established engineering supports. Mark anything uncertain [VERIFY]. Simplify, never falsify.
