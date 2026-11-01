@@ -32,6 +32,28 @@ _HINTS = {
 }
 DEFAULT_QUESTION = ('Give a thorough summary of this video: what is shown, any on-screen text or code, '
                     'and what is said, in chronological order.')
+INDEX_QUESTION = (
+    'Build a visual index of the mechanical parts and motion in this video, for someone who will '
+    'model the mechanism in 3D. List only moments where something is clearly VISIBLE on screen: a '
+    'distinct component, a distinct phase of a cycle, a cutaway or cross-section, or a labelled '
+    'diagram. Prefer moments where the part is unobstructed and the view is steady. One line per '
+    'moment, at most 25 lines, in exactly this format:\n'
+    'MM:SS | component | what it does or how it moves | what is visible (view angle, cutaway, labels)\n'
+    'Then add a short "Not shown" list of parts that are only mentioned in narration, never seen.'
+)
+TIMESTAMP_RE = re.compile(r'(?<![\d:])(\d{1,2}:[0-5]\d(?::[0-5]\d)?)(?![\d:])')
+
+
+def index_timestamps(text: str) -> list[str]:
+    """MM:SS / H:MM:SS stamps from an index answer, sorted and de-duplicated."""
+    def seconds(stamp: str) -> int:
+        return sum(int(part) * 60 ** i for i, part in enumerate(reversed(stamp.split(':'))))
+    unique: dict[int, str] = {}
+    for stamp in TIMESTAMP_RE.findall(text or ''):
+        unique.setdefault(seconds(stamp), stamp)
+    return [unique[s] for s in sorted(unique)]
+
+
 PROMPT_SUFFIX = ('\n\nCite an MM:SS (or H:MM:SS) timestamp for every claim about a specific moment. '
                  'Separate what is seen from what is heard when it matters. If the video does not '
                  'show or say something needed to answer, say so plainly instead of guessing.')

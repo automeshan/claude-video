@@ -40,6 +40,19 @@ MAX_READ_DIMENSION = 1998
 DEDUP_THUMB = 16
 DEDUP_THRESHOLD = 2.0
 SHOWINFO_TS_RE = re.compile(r"pts_time:([^\s]+)")
+# Motion-equalised sampling (``mechanism`` detail). Scene detection only fires
+# on cuts, so a single continuous shot of a piston, valve train or gear set
+# yields one frame. Instead, ffmpeg measures mean absolute luma change between
+# consecutive low-res samples (signalstats YDIF, 0-255), and frames are placed
+# at equal steps of *accumulated motion*: dense where parts move, sparse where
+# nothing changes. Only a few thousand numbers ever reach Python.
+MOTION_ANALYSIS_FPS = 8.0
+MOTION_MAX_SAMPLES = 6000          # long ranges sample slower to bound the analysis pass
+MOTION_THUMB = "64:36"
+MOTION_NOISE_FLOOR = 0.1           # per-step change below this is encoder noise
+MOTION_STEP_CLIP = 3.0             # a hard cut counts as a few steps of motion, not hundreds
+MOTION_MIN_STEP = 0.75             # least accumulated motion between two kept frames
+MOTION_SAMPLE_RE = re.compile(r"pts_time:([0-9.eE+-]+)\s*\n\s*lavfi\.signalstats\.YDIF=([0-9.eE+-]+)")
 
 
 def _scale_filter(resolution: int) -> str:
@@ -73,7 +86,16 @@ def parse_time(value: str | float | int | None) -> float | None:
         raise SystemExit("Invalid time; expected finite non-negative SS, MM:SS, or HH:MM:SS.") from None
 
 
-def format_time(seconds: float) -> str:
+def format_time(seconds: float, precise: bool = False) -> str:
+    """MM:SS (or H:MM:SS). ``precise`` keeps hundredths (MM:SS.ss) for motion
+    frames that sit a fraction of a second apart."""
+    if precise:
+        centis = int(round(seconds * 100))
+        whole, frac = divmod(centis, 100)
+        hours, rem = divmod(whole, 3600)
+        minutes, sec = divmod(rem, 60)
+        stamp = f"{minutes:02d}:{sec:02d}.{frac:02d}"
+        return f"{hours}:{stamp}" if hours else stamp
     total = int(round(seconds))
     hours, rem = divmod(total, 3600)
     minutes, sec = divmod(rem, 60)
@@ -335,6 +357,8 @@ def extract_at_timestamps(
     max_frames: int | None = None,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
+    prefix: str = "cue",
+    reason: str = "transcript-cue",
 ) -> tuple[list[dict], dict]:
     """Grab exactly one frame at each requested timestamp (transcript cues).
 
@@ -349,7 +373,7 @@ def extract_at_timestamps(
         raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    for existing in out_dir.glob("cue_*.jpg"):
+    for existing in out_dir.glob(f"{prefix}_*.jpg"):
         existing.unlink()
 
     lo = start_seconds or 0.0
@@ -365,7 +389,7 @@ def extract_at_timestamps(
 
     out: list[dict] = []
     for t in points:
-        path = out_dir / f"cue_{len(out):04d}.jpg"
+        path = out_dir / f"{prefix}_{len(out):04d}.jpg"
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "info", "-y",
             "-ss", f"{t:.6f}", "-i", str(Path(video_path).resolve()),
@@ -376,7 +400,7 @@ def extract_at_timestamps(
         if result.returncode != 0:
             raise SystemExit(f"ffmpeg cue extraction failed: {diagnostic(result.stderr)}")
         if path.exists():
-            frame = _emitted_frames([path], result.stderr, t, "transcript-cue")[0]
+            frame = _emitted_frames([path], result.stderr, t, reason)[0]
             frame["requested_timestamp_seconds"] = t
             frame["index"] = len(out)
             if frame["timestamp_seconds"] <= hi:
@@ -680,6 +704,131 @@ def extract_keyframes(
         "deduped_count": n_dropped,
         "selected_count": len(selected),
         "fallback": False,
+    }
+
+
+def motion_samples(
+    video_path: str,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> list[tuple[float, float]]:
+    """Return ``(absolute_seconds, change_from_previous_sample)`` pairs.
+
+    One cheap decode: grey 64x36 thumbnails at up to 8 fps, with ffmpeg's
+    signalstats computing each sample's mean absolute luma difference from the
+    previous one. Raises SystemExit when ffmpeg fails or prints nothing usable.
+    """
+    if shutil.which("ffmpeg") is None:
+        raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
+    duration = get_metadata(video_path)["duration_seconds"]
+    start = start_seconds or 0.0
+    end = min(duration, end_seconds) if end_seconds is not None else duration
+    if end <= start:
+        raise SystemExit("Requested range is outside the video duration")
+    rate = max(0.5, min(MOTION_ANALYSIS_FPS, MOTION_MAX_SAMPLES / (end - start)))
+    vf = (f"fps={rate:.6g},scale={MOTION_THUMB}:flags=area,format=gray,signalstats,"
+          "metadata=mode=print:key=lavfi.signalstats.YDIF:file=-")
+    result = run_text([
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{start:.6f}", "-to", f"{end:.6f}", "-i", str(Path(video_path).resolve()),
+        "-vf", vf, "-an", "-f", "null", "-",
+    ])
+    if result.returncode != 0:
+        raise SystemExit(f"ffmpeg motion analysis failed: {diagnostic(result.stderr)}")
+    samples = [(start + float(t), float(d)) for t, d in MOTION_SAMPLE_RE.findall(result.stdout)]
+    if not samples or any(not math.isfinite(t) or not math.isfinite(d) for t, d in samples):
+        raise SystemExit("ffmpeg motion analysis printed no usable samples")
+    return samples
+
+
+def select_by_motion(
+    samples: list[tuple[float, float]],
+    max_frames: int | None,
+    noise_floor: float = MOTION_NOISE_FLOOR,
+    step_clip: float = MOTION_STEP_CLIP,
+    min_step: float = MOTION_MIN_STEP,
+) -> tuple[list[float], float]:
+    """Pick timestamps at equal increments of accumulated motion.
+
+    Each step contributes ``min(max(0, change - noise_floor), step_clip)``: noise
+    vanishes, and a hard cut counts as a short burst of motion rather than
+    swallowing the whole budget. The frame count shrinks for low-motion clips
+    (at most one frame per ``min_step`` of motion), so a static shot yields one
+    frame instead of a pile of duplicates. The first sample is always kept.
+    Returns ``(timestamps, total_motion)``.
+    """
+    if not samples:
+        return [], 0.0
+    cumulative, total = [], 0.0
+    for i, (_, change) in enumerate(samples):
+        if i:
+            total += min(max(0.0, change - noise_floor), step_clip)
+        cumulative.append(total)
+    if total <= 0:
+        return [samples[0][0]], 0.0
+    cap = max_frames if max_frames is not None else len(samples)
+    n = max(1, min(cap, len(samples), int(total / min_step) + 1))
+    if n == 1:
+        return [samples[0][0]], total
+    import bisect
+    picks: list[int] = []
+    for k in range(n):
+        idx = min(bisect.bisect_left(cumulative, total * k / (n - 1)), len(samples) - 1)
+        if not picks or idx != picks[-1]:
+            picks.append(idx)
+    return [samples[i][0] for i in picks], total
+
+
+def extract_motion_frames(
+    video_path: str,
+    out_dir: Path,
+    resolution: int = 768,
+    max_frames: int | None = 30,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+    dedup: bool = True,
+) -> tuple[list[dict], dict]:
+    """``mechanism`` detail: motion-equalised frames for continuous mechanical footage.
+
+    Falls back to scene/uniform selection if the analysis pass fails, so a
+    quirky ffmpeg build degrades to the stock behaviour instead of an error.
+    """
+    validate_controls(resolution, max_frames, start_seconds, end_seconds)
+    try:
+        samples = motion_samples(video_path, start_seconds, end_seconds)
+    except SystemExit as exc:
+        print(f"[watch] motion analysis unavailable; using scene/uniform selection. {exc}", file=sys.stderr)
+        duration = get_metadata(video_path)["duration_seconds"]
+        span = (min(duration, end_seconds) if end_seconds is not None else duration) - (start_seconds or 0.0)
+        fps, target = auto_fps_focus(span, max_frames=max_frames or 100)
+        frames_out, meta = extract_scene_or_uniform(
+            video_path, out_dir, fps=fps, target_frames=target, resolution=resolution,
+            max_frames=max_frames, start_seconds=start_seconds, end_seconds=end_seconds, dedup=dedup)
+        meta["fallback"] = True
+        return frames_out, meta
+    times, total = select_by_motion(samples, max_frames)
+    frames_out, _ = extract_at_timestamps(
+        video_path, out_dir, times, resolution=resolution, max_frames=max_frames,
+        start_seconds=start_seconds, end_seconds=end_seconds, prefix="motion", reason="motion")
+    if frames_out:
+        frames_out[0]["reason"] = "first-frame"
+    selected_count = len(frames_out)
+    n_dropped = 0
+    # Motion spacing already guarantees distinct frames, and the 16x16 dedup
+    # thumbnail cannot see a small part moving slightly — it would delete the
+    # turnaround poses (top/bottom dead centre). Dedup only near-static clips,
+    # where a grain or keyframe flicker could pass for motion.
+    if dedup and total < MOTION_MIN_STEP * 4:
+        frames_out, n_dropped = dedupe_perceptual(frames_out)
+    return frames_out, {
+        "engine": "motion",
+        "candidate_count": selected_count,
+        "analysis_samples": len(samples),
+        "total_motion": round(total, 2),
+        "deduped_count": n_dropped,
+        "selected_count": len(frames_out),
+        "fallback": False,
+        "static": total <= 0,
     }
 
 

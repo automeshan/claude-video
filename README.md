@@ -2,6 +2,19 @@
 
 Give an agent video evidence: a URL or local file becomes timestamped frames and a transcript. Install it in Claude Code (the desktop app, VS Code, or a terminal), or use it with Codex and other [Agent Skills](https://agentskills.io) hosts. Native captions come first; optional local WhisperX or Groq/OpenAI transcription handles videos without captions.
 
+## Mechanism fork
+
+This fork adds a workflow for studying how machines work from video (engines, gearboxes, firing cycles) so they can be scripted and modelled in 3D:
+
+```
+/watch engine.mp4 --detail transcript                                   # 1. what is explained when
+/watch https://youtu.be/ID --engine gemini --index                      # 2. optional: Gemini lists visible parts + timestamps
+/watch engine.mp4 --detail transcript --timestamps 0:42,1:15 --resolution 1024 --reference-dir refs/engine-cues
+/watch engine.mp4 --detail mechanism --start 1:10 --end 1:25 --reference-dir refs/engine-cycle
+```
+
+`--detail mechanism` spaces frames by measured motion instead of scene cuts, so a single continuous shot of a moving piston is covered properly (stock `balanced` falls back to evenly spaced frames there). `--reference-dir` keeps the frames plus a `REFERENCE.md` to fill in. See `CHANGELOG.md`.
+
 ## Choose your app
 
 **Using Claude? Run Watch in Claude Code.** Install it through Claude Desktop and use a **Code** session, or add it with the plugin commands in VS Code or a terminal. Watch does **not** work in Claude Chat or Cowork; [see why](#chat-cowork-and-browser-apps).

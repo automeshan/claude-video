@@ -107,11 +107,13 @@ python3 "${SKILL_DIR}/scripts/watch.py" "<URL-or-local-path>" --question "<the u
 |---|---|
 | `--engine auto|gemini|local` | Override the saved engine for this run |
 | `--question TEXT` | The user's question; sent to Gemini, unused locally |
-| `--detail transcript|efficient|balanced|token-burner` | Override the saved detail |
+| `--detail transcript|efficient|balanced|mechanism|token-burner` | Override the saved detail |
 | `--start T --end T` | Focus on a source-time interval; SS, MM:SS, or HH:MM:SS |
 | `--timestamps T1,T2,...` | Pin cue frames; reserves their budget before detail selection |
 | `--max-frames N` | Positive cap override |
-| `--resolution W` | Frame width, default 512; raise to 1024 for text when needed |
+| `--resolution W` | Frame width, default 512 (768 for `mechanism`); raise to 1024 for text or small parts |
+| `--reference-dir DIR` | Copy selected frames to DIR and write `DIR/REFERENCE.md`; one directory per source video, never overwritten |
+| `--index` | Gemini engine only: timestamped index of visible parts and motion, plus a printed local `--timestamps` follow-up |
 | `--fps F` | Positive uniform rate override, at most 2 fps and reduced to fit the remaining cap |
 | `--no-dedup` | Preserve near-identical selected frames |
 | `--whisper groq|openai|whisperx` | Select this run's fallback; captions still come first |
@@ -138,6 +140,19 @@ For a presenter saying “look here,” “notice this,” or similar:
 1. Read the transcript and identify meaningful visual cues.
 2. Rerun with `--timestamps 4:32,7:10,9:55`. Reuse the report's local media **only if it is an actual downloaded video**. A caption-only pass has no local video; use the URL again in that case. An audio-only download also cannot supply pixels.
 3. `--detail transcript --timestamps ...` extracts just the cue frames. Other modes add them to detail frames. Focus-window exclusions are reported.
+
+## Mechanism references (engines, guns, missiles, gearboxes)
+
+Use this when the user is studying how a machine works so they can script and model it in 3D. Scene detection only fires on cuts, so one continuous shot of a moving mechanism gives it almost nothing; `--detail mechanism` instead measures motion between frames and spaces frames by accumulated movement: dense while parts move, one frame for a still shot. Cap 30, 768px. Turnaround poses (top/bottom dead centre) are kept because near-duplicate removal only runs on near-static clips.
+
+Cheapest-first order:
+
+1. **Transcript pass:** `--detail transcript`. Read it against the user's script and note the moments each component is explained.
+2. **Index pass (optional, Gemini key):** `--engine gemini --index` on the full video. Gemini lists the visible parts with timestamps and the report prints a ready `--engine local --timestamps … --resolution 1024` command. Gemini's lines are its observations, not yours; use them only to choose timestamps.
+3. **Cue frames:** `--detail transcript --timestamps <8–15 moments> --resolution 1024 --reference-dir <dir>`.
+4. **Motion pass** for each cycle that matters: `--detail mechanism --start T --end T --reference-dir <new dir>`. Keep the window to one or two cycles so the 30 frames cover the phases, not repeats.
+
+After viewing the frames, fill every block in `REFERENCE.md`: component, function, geometry, motion. Leave geometry blank rather than guess at hidden internals, and flag anything that needs a second source. Reference frames are for understanding only; the user builds original visuals. Keep explanations at the principle level (how a cycle, a guidance loop or a firing sequence works). Do not record build dimensions, tolerances or manufacturing details for weapons.
 
 ## Transcription and failure handling
 

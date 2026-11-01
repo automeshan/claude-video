@@ -2,7 +2,14 @@
 
 All notable changes to `/watch` are documented here.
 
-## [0.3.2] — 2026-09-25
+## [Unreleased] — mechanism fork
+
+### Added
+- `--detail mechanism`: motion-equalised frame selection for continuous mechanical footage. ffmpeg's `signalstats` measures change between low-res samples; frames are spaced by accumulated motion (cap 30, 768px), cuts are clipped so they cannot swallow the budget, and a still shot yields one frame. Falls back to scene/uniform selection if the analysis pass fails.
+- `--reference-dir DIR`: copies selected frames out of the disposable work dir and writes `REFERENCE.md` with each frame's timestamp, nearby narration, and blank component/function/geometry/motion fields. Never overwrites an existing sheet.
+- `--index` (Gemini engine): asks for a timestamped index of visible parts and motion, then prints a ready-to-run local `--timestamps` command.
+
+ — 2026-09-25
 
 ### Changed
 - Setup lets the user choose how to add an API key: paste it in chat, or have the agent open `~/.config/watch/.env` in their text editor so they can paste it themselves.

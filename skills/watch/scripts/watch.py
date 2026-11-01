@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import shlex
 import shutil
 import sys
 import tempfile
@@ -17,17 +18,19 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from config import ConfigError, frame_cap, get_config, load_gemini_key, resolve_engine  # noqa: E402
+from config import ConfigError, default_resolution, frame_cap, get_config, load_gemini_key, resolve_engine  # noqa: E402
 import gemini  # noqa: E402
 from download import download, fetch_captions, is_url, auth_args  # noqa: E402
-from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps, validate_controls  # noqa: E402
+from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_motion_frames, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps, validate_controls  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 from runtime import configure_stdio  # noqa: E402
+import reference  # noqa: E402
 
 
 LOCAL_ONLY_FLAGS = (("--detail", "detail"), ("--fps", "fps"), ("--max-frames", "max_frames"),
-                    ("--timestamps", "timestamps"), ("--whisper", "whisper"), ("--sub-lang", "sub_lang"))
+                    ("--timestamps", "timestamps"), ("--whisper", "whisper"), ("--sub-lang", "sub_lang"),
+                    ("--reference-dir", "reference_dir"))
 
 
 def run_gemini(args, config, key, start_sec, end_sec, auth) -> int:
@@ -53,7 +56,10 @@ def run_gemini(args, config, key, start_sec, end_sec, auth) -> int:
             video = {"uri": uploaded["uri"], "mime_type": uploaded["mime_type"]}
             sent = "video uploaded to Google, deleted after the answer"
         print(f"[watch] asking {config['gemini_model']}…", file=sys.stderr)
-        result = gemini.ask(video, args.question, model=config["gemini_model"], key=key,
+        question = args.question
+        if args.index:
+            question = gemini.INDEX_QUESTION + (f"\n\nAlso focus on: {args.question}" if args.question else "")
+        result = gemini.ask(video, question, model=config["gemini_model"], key=key,
                             clip=clip, timeout=config["gemini_timeout"])
     except SystemExit as exc:
         error = str(exc)
@@ -88,6 +94,21 @@ def run_gemini(args, config, key, start_sec, end_sec, auth) -> int:
           "Relay them as such; rerun with `--engine local` to inspect frames directly._")
     print()
     print(result["text"])
+    stamps = gemini.index_timestamps(result["text"]) if args.index else []
+    if stamps:
+        print()
+        print("## Suggested local follow-up")
+        print()
+        print("_Pull these moments as full frames you can inspect yourself (needs ffmpeg + yt-dlp locally). "
+              "Drop stamps that are not useful before running._")
+        print()
+        command = [sys.executable, str(SCRIPT_DIR / "watch.py"), args.source, "--engine", "local",
+                   "--detail", "transcript", "--timestamps", ",".join(stamps), "--resolution", "1024"]
+        if args.reference_dir:
+            command += ["--reference-dir", args.reference_dir]
+        print("```")
+        print(shlex.join(command))
+        print("```")
     return 0
 
 
@@ -98,14 +119,16 @@ def main() -> int:
     )
     ap.add_argument("source", help="Video URL or local file path")
     ap.add_argument("--max-frames", type=int, default=None, help="Override frame cap")
-    ap.add_argument("--resolution", type=int, default=512, help="Frame width in pixels (default 512)")
+    ap.add_argument("--resolution", type=int, default=None,
+                    help="Frame width in pixels (default 512; 768 for mechanism detail)")
     ap.add_argument("--fps", type=float, default=None, help="Override auto-fps")
     ap.add_argument(
         "--detail",
-        choices=["transcript", "efficient", "balanced", "token-burner"],
+        choices=["transcript", "efficient", "balanced", "mechanism", "token-burner"],
         default=None,
         help="Fidelity/speed dial: transcript (no frames), efficient (fast keyframes, cap 50), "
-             "balanced (scene, cap 100), token-burner (scene, uncapped).",
+             "balanced (scene, cap 100), mechanism (motion-equalised for continuous mechanical "
+             "footage, cap 30, 768px), token-burner (scene, uncapped).",
     )
     ap.add_argument(
         "--timestamps",
@@ -144,16 +167,23 @@ def main() -> int:
                          "local: frames + transcript on this machine. Default auto: gemini when a key exists.")
     ap.add_argument("--question", default=None,
                     help="The user's question. Sent to Gemini on a gemini run; unused by the local engine.")
+    ap.add_argument("--index", action="store_true",
+                    help="Gemini only: ask for a timestamped index of visible parts and motion, then print "
+                         "a ready-to-run local --timestamps follow-up.")
+    ap.add_argument("--reference-dir", default=None,
+                    help="Copy selected frames here and write REFERENCE.md (per-frame narration + blank "
+                         "component/geometry/motion fields). One directory per source video; never overwritten.")
     args = ap.parse_args()
     if args.no_whisper and args.whisper:
         ap.error("--no-whisper conflicts with --whisper")
 
     config = get_config(backend_override="none" if args.no_whisper else args.whisper)
     detail = args.detail or config["detail"]
+    resolution = args.resolution if args.resolution is not None else default_resolution(detail)
     max_frames = args.max_frames if args.max_frames is not None else frame_cap(detail)
     budget_cap = max_frames if max_frames is not None else 100
     start_sec, end_sec = parse_time(args.start), parse_time(args.end)
-    validate_controls(args.resolution, max_frames, start_sec, end_sec, args.fps)
+    validate_controls(resolution, max_frames, start_sec, end_sec, args.fps)
     cue_timestamps = parse_timestamps(args.timestamps)
     backend_choice = "none" if args.no_whisper else args.whisper or config["whisper_backend"]
     cookies_file = args.cookies if args.cookies is not None else (None if args.cookies_from_browser else config["cookies_file"])
@@ -164,6 +194,10 @@ def main() -> int:
     gemini_key = load_gemini_key()
     if resolve_engine(args.engine or config["engine"], bool(gemini_key)) == "gemini":
         return run_gemini(args, config, gemini_key, start_sec, end_sec, auth)
+    if args.index:
+        ap.error("--index needs the Gemini engine (GEMINI_API_KEY, or --engine gemini)")
+    if args.reference_dir:
+        reference.prepare(args.reference_dir)  # Fail before downloading if the sheet already exists.
 
     parent = Path(args.out_dir).expanduser().resolve() if args.out_dir else None
     if parent:
@@ -245,14 +279,16 @@ def main() -> int:
         try:
             if cue_timestamps:
                 cue_frames, cue_meta = extract_at_timestamps(
-                    video_path, work / "frames", cue_timestamps, resolution=args.resolution,
+                    video_path, work / "frames", cue_timestamps, resolution=resolution,
                     max_frames=max_frames, start_seconds=start_sec, end_seconds=effective_end or end_sec)
             detail_budget = None if max_frames is None else max_frames - len(cue_frames)
             if detail != "transcript" and detail_budget != 0:
-                kwargs = dict(resolution=args.resolution, max_frames=detail_budget,
+                kwargs = dict(resolution=resolution, max_frames=detail_budget,
                               start_seconds=start_sec, end_seconds=effective_end or end_sec, dedup=not args.no_dedup)
                 if detail == "efficient":
                     frames, frame_meta = extract_keyframes(video_path, work / "frames", **kwargs)
+                elif detail == "mechanism":
+                    frames, frame_meta = extract_motion_frames(video_path, work / "frames", **kwargs)
                 else:
                     frames, frame_meta = extract_scene_or_uniform(video_path, work / "frames", fps=fps, target_frames=target, **kwargs)
         except SystemExit as exc:
@@ -291,10 +327,16 @@ def main() -> int:
     transcript_text = format_transcript(transcript_segments)
     if track_available:
         transcript_state = "available" if transcript_segments else ("no speech in selected range" if focused and all_segments else "no speech")
+    info = dl.get("info") or {}
+    sheet = None
+    if args.reference_dir and frames:
+        try:
+            sheet = reference.write(args.reference_dir, frames, all_segments, source=args.source, info=info,
+                                    detail=detail, resolution=resolution)
+        except (OSError, SystemExit) as exc:
+            errors.append(f"Reference sheet not written: {exc}")
     for error in errors:
         print(f"[watch] {error}", file=sys.stderr)
-
-    info = dl.get("info") or {}
 
     print()
     print("# watch: video report")
@@ -324,6 +366,8 @@ def main() -> int:
     if detail != "transcript":
         cap_label = "unlimited" if detail_budget is None else str(detail_budget)
         engine = frame_meta.get("engine", "scene")
+        if engine == "motion" and frame_meta.get("static"):
+            engine = "motion: no movement detected"
         fallback = " fallback" if frame_meta.get("fallback") else ""
         deduped = frame_meta.get("deduped_count", 0)
         dedup_note = f", {deduped} near-duplicate{'s' if deduped != 1 else ''} dropped" if deduped else ""
@@ -340,8 +384,10 @@ def main() -> int:
             f"- **Cue frames:** {len(cue_frames)} at transcript-flagged timestamps "
             f"(transcript-cue{drop_note})"
         )
+    if sheet:
+        print(f"- **Reference sheet:** `{sheet}` (frames copied beside it; fill each block after viewing its frame)")
     if frames:
-        print(f"- **Frame size:** max {args.resolution}px wide, max 1998px tall")
+        print(f"- **Frame size:** max {resolution}px wide, max 1998px tall")
     if transcript_segments:
         in_range = " in range" if focused else ""
         print(
@@ -387,7 +433,8 @@ def main() -> int:
         for frame in frames:
             print(
                 f"- `{frame['path']}` "
-                f"(t={format_time(frame['timestamp_seconds'])}, reason={frame.get('reason', 'selected')})"
+                f"(t={format_time(frame['timestamp_seconds'], precise=detail == 'mechanism')}, "
+                f"reason={frame.get('reason', 'selected')})"
             )
     else:
         print("_No frames extracted._")
